@@ -34,6 +34,9 @@
 #include <imagezero_ros/ros_support.h>
 #include <ros/ros.h>
 #include <sensor_msgs/image_encodings.h>
+#include <imagezero/encoder.h>
+#include <imagezero/decoder.h>
+#include <memory>
 
 using namespace cv;
 using namespace std;
@@ -54,6 +57,8 @@ namespace IZ
 {
   sensor_msgs::CompressedImage compressImage(const sensor_msgs::Image& image)
   {
+    ros::Time start = ros::Time::now();
+
     if (!encode_tables_initialized) {
       encode_tables_initialized = true;
       IZ::initEncodeTable();
@@ -64,14 +69,8 @@ namespace IZ
     compressed.header = image.header;
     compressed.format = image.encoding;
 
-    // Compression settings
-    std::vector<int> params;
-
     // Bit depth of image encoding
     int bitDepth = enc::bitDepth(image.encoding);
-
-    params.push_back(CV_IMWRITE_PXM_BINARY);
-    params.push_back(1);
 
     // Update ros message format header
     compressed.format += "; iz compressed ";
@@ -80,74 +79,32 @@ namespace IZ
     if ((bitDepth == 8) || (bitDepth == 16))
     {
 
-      // Target image format
-      stringstream targetFormat;
-      if (enc::isColor(image.encoding))
-      {
-        // convert color images to RGB domain
-        targetFormat << "bgr" << bitDepth;
-        compressed.format += targetFormat.str();
-      }
+      IZ::Image<> pi;
+      pi.setWidth(image.width);
+      pi.setSamplesPerLine(3*image.width); // always have 3 channels as far as IZ is concerned
 
-      // OpenCV-ros bridge
-      try
-      {
-        boost::shared_ptr<sensor_msgs::CompressedImagePtr> tracked_object;
-        cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(image, tracked_object, targetFormat.str());
+      if(enc::numChannels(image.encoding) == 3)
+          pi.setHeight(image.height);
+      else if(enc::numChannels(image.encoding) == 1)
+          pi.setHeight(image.height / 3); // If we have 1 channel, pack the data down into 3
 
-        IZ::PortableImage pi;
+      std::vector<uint8_t> srcData = image.data;
 
-        // Compress image
-        std::vector<unsigned char> ppm_buffer;
-        ros::Time now = ros::Time::now();
-        if (cv::imencode(".ppm", cv_ptr->image, ppm_buffer, params))
-        {
-          if (!pi.readHeader((const unsigned char*) &ppm_buffer[0]))
-          {
-            std::stringstream ss;
-            for (int i = 0; i < 20; i++)
-            {
-              ss << ppm_buffer[i];
-            }
-            ROS_ERROR("Unable to read PPM produced by OpenCV.  First few bytes: %s", ss.str().c_str());
-            return sensor_msgs::CompressedImage();
-          }
-          if (pi.components() != 3)
-          {
-            ROS_ERROR("Can only handle 24-bit PPM files.");
-            return sensor_msgs::CompressedImage();
-          }
-          unsigned char *dest = static_cast<unsigned char*>(malloc(pi.height() * pi.width() * 4 + 33));
-          //IZ::initEncodeTable();
-          unsigned char *destEnd = IZ::encodeImage(pi, dest);
-          size_t size = destEnd - dest;
-          compressed.data.resize(size);
-          memcpy(&compressed.data[0], dest, size);
-          free(dest);
-          ros::Time iz_time = ros::Time::now();
-          ROS_DEBUG_THROTTLE(1, "Took %lums to compress %lu bytes to %lu bytes (%f ratio)",
-                             (iz_time - now).toNSec()/1000000L,
-                             image.data.size(),
-                             compressed.data.size(),
-                             (double)image.data.size() / (double)image.data.size());
-        }
-        else
-        {
-          ROS_ERROR("cv::imencode (ppm) failed on input image");
-          return sensor_msgs::CompressedImage();
-        }
-      }
-      catch (cv_bridge::Exception& e)
-      {
-        ROS_ERROR("%s", e.what());
-        return sensor_msgs::CompressedImage();
-      }
-      catch (cv::Exception& e)
-      {
-        ROS_ERROR("%s", e.what());
-        return sensor_msgs::CompressedImage();
-      }
+      pi.setData(&srcData[0]);
+      compressed.data.resize(pi.height() * pi.width() * 4 + 33);
+      unsigned char *destEnd = IZ::encodeImage(pi, &compressed.data[0]);
+      size_t size = destEnd - &compressed.data[0];
+      compressed.data.resize(size);
       
+    ros::Time iz_time = ros::Time::now();
+    ROS_INFO_THROTTLE(1, "Took %.4fms to compress %lu bytes to %lu(%lu) bytes (%.1f%%)",
+                       (iz_time - start).toSec()*1000,
+                       image.data.size(),
+                       compressed.data.size(), size,
+                       100.0 * (double)compressed.data.size() / (double)image.data.size());
+
+    ROS_INFO_THROTTLE(1, "sz: %dx%d enc: %s chan: %d color: %d", pi.width(), pi.height(), image.encoding.c_str(), enc::numChannels(image.encoding), enc::isColor(image.encoding));
+
       return compressed;
     }
     else
@@ -167,115 +124,23 @@ namespace IZ
       IZ::initDecodeTable();
     }
 
-    IZ::PortableImage pi;
-    //IZ::initDecodeTable();
+    IZ::Image<> pi;
+    sensor_msgs::Image msg;
     IZ::decodeImageSize(pi, &compressed->data[0]);
-    pi.setComponents(3);
-    const unsigned int dataSize = pi.width() * pi.height() * pi.components();
-    unsigned char* dest = (unsigned char*) malloc(dataSize + 33);
-    pi.writeHeader(dest);
+    const unsigned int dataSize = pi.width() * pi.height() * 3;
+    msg.data.resize(dataSize);
+    pi.setData(&msg.data[0]);
     IZ::decodeImage(pi, &compressed->data[0]);
 
-    std::vector<unsigned char> ppm_data;
-    size_t size = pi.data() - dest + dataSize;
-    ppm_data.resize(size);
-    memcpy(&ppm_data[0], dest, size);
-    free(dest);
+    const size_t split_pos = compressed->format.find(';');
+    std::string image_encoding = compressed->format.substr(0, split_pos);
+    msg.width = pi.width();
+    msg.height = pi.height() * 3 / enc::numChannels(image_encoding); // if only 1 channel, we 3x the size, otherwise it's using actual size
+    msg.encoding = image_encoding;
+    msg.step = msg.width * enc::numChannels(image_encoding);
 
-    cv_bridge::CvImagePtr cv_ptr(new cv_bridge::CvImage);
+    ROS_INFO_THROTTLE(1, "sz: %dx%d enc: %s step: %d chan: %d color: %d", msg.width, msg.height, msg.encoding.c_str(), msg.step, enc::numChannels(msg.encoding), enc::isColor(msg.encoding));
 
-    // Copy compressed header
-    cv_ptr->header = compressed->header;
-
-    // Decode color/mono image
-    try
-    {
-      cv_ptr->image = cv::imdecode(cv::Mat(ppm_data), CV_LOAD_IMAGE_COLOR);
-
-      // Assign image encoding string
-      const size_t split_pos = compressed->format.find(';');
-      if (split_pos == std::string::npos)
-      {
-        switch (cv_ptr->image.channels())
-        {
-          case 1:
-            cv_ptr->encoding = enc::MONO8;
-            break;
-          case 3:
-            cv_ptr->encoding = enc::BGR8;
-            break;
-          default:
-            ROS_ERROR("Unsupported number of channels: %i", cv_ptr->image.channels());
-            break;
-        }
-      }
-      else
-      {
-        std::string image_encoding = compressed->format.substr(0, split_pos);
-
-        cv_ptr->encoding = image_encoding;
-
-        if (enc::isColor(image_encoding))
-        {
-          std::string compressed_encoding = compressed->format.substr(split_pos);
-          bool compressed_bgr_image = (compressed_encoding.find("compressed bgr") != std::string::npos);
-
-          // Revert color transformation
-          if (compressed_bgr_image)
-          {
-            // if necessary convert colors from bgr to rgb
-            if ((image_encoding == enc::RGB8) || (image_encoding == enc::RGB16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_BGR2RGB);
-            }
-
-            if ((image_encoding == enc::RGBA8) || (image_encoding == enc::RGBA16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_BGR2RGBA);
-            }
-
-            if ((image_encoding == enc::BGRA8) || (image_encoding == enc::BGRA16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_BGR2BGRA);
-            }
-          }
-          else
-          {
-            // if necessary convert colors from rgb to bgr
-            if ((image_encoding == enc::BGR8) || (image_encoding == enc::BGR16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_RGB2BGR);
-            }
-
-            if ((image_encoding == enc::BGRA8) || (image_encoding == enc::BGRA16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_RGB2BGRA);
-            }
-
-            if ((image_encoding == enc::RGBA8) || (image_encoding == enc::RGBA16))
-            {
-              cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_RGB2RGBA);
-            }
-          }
-        }
-      }
-    }
-    catch (cv::Exception& e)
-    {
-      ROS_ERROR("%s", e.what());
-    }
-
-    size_t rows = cv_ptr->image.rows;
-    size_t cols = cv_ptr->image.cols;
-
-    if ((rows > 0) && (cols > 0))
-    {
-      // Publish message to user callback
-      sensor_msgs::Image msg;
-      cv_ptr->toImageMsg(msg);
-      return msg;
-    }
-
-    return sensor_msgs::Image();
+    return msg;
   }
 }
