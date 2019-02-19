@@ -104,7 +104,7 @@ namespace IZ
                        100.0 * (double)compressed.data.size() / (double)image.data.size());
 
     ROS_INFO_THROTTLE(1, "sz: %dx%d enc: %s chan: %d color: %d", pi.width(), pi.height(), image.encoding.c_str(), enc::numChannels(image.encoding), enc::isColor(image.encoding));
-
+      compressed.header = image.header;
       return compressed;
     }
     else
@@ -134,6 +134,7 @@ namespace IZ
 
     const size_t split_pos = compressed->format.find(';');
     std::string image_encoding = compressed->format.substr(0, split_pos);
+    msg.header = compressed->header;
     msg.width = pi.width();
     msg.height = pi.height() * 3 / enc::numChannels(image_encoding); // if only 1 channel, we 3x the size, otherwise it's using actual size
     msg.encoding = image_encoding;
